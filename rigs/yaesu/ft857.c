@@ -108,6 +108,7 @@ enum ft857_native_cmd_e
     FT857_NATIVE_CAT_PWR_ON,
     FT857_NATIVE_CAT_PWR_OFF,
     FT857_NATIVE_CAT_EEPROM_READ,
+    FT857_NATIVE_CAT_GET_TX_METERING,
     FT857_NATIVE_SIZE     /* end marker */
 };
 
@@ -158,9 +159,17 @@ struct ft857_priv_data
     struct timeval tx_status_tv;
     unsigned char tx_status;
 
+    /* tx levels */
+    struct timeval tx_level_tv;
+    unsigned char swr_level;
+    unsigned char alc_level;
+    unsigned char mod_level;
+    unsigned char pwr_level; /* TX power level */
+
     /* freq & mode status */
     struct timeval fm_status_tv;
     unsigned char fm_status[YAESU_CMD_LENGTH + 1];
+    float swr;
 };
 
 
@@ -213,6 +222,8 @@ static const yaesu_cmd_set_t ncmd[] =
     { 1, { 0x00, 0x00, 0x00, 0x00, 0x0f } }, /* pwr on */
     { 1, { 0x00, 0x00, 0x00, 0x00, 0x8f } }, /* pwr off */
     { 0, { 0x00, 0x00, 0x00, 0x00, 0xbb } }, /* eeprom read */
+    { 1, { 0x00, 0x00, 0x00, 0x00, 0xbd } }, /* get TX metering levels (PWR, SWR, MOD, ALC) */
+
 };
 
 enum ft857_digi
@@ -239,6 +250,74 @@ enum ft857_digi
 
 static int ft857_send_icmd(RIG *rig, int index, const unsigned char *data);
 
+
+#define FT857_STR_CAL { 16, \
+                { \
+                    { 0x00, -54 }, /* S0 */ \
+                    { 0x01, -48 }, \
+                    { 0x02, -42 }, \
+                    { 0x03, -36 }, \
+                    { 0x04, -30 }, \
+                    { 0x05, -24 }, \
+                    { 0x06, -18 }, \
+                    { 0x07, -12 }, \
+                    { 0x08, -6 }, \
+                    { 0x09,  0 },  /* S9 */ \
+                    { 0x0A,  10 }, /* +10 */ \
+                    { 0x0B,  20 }, /* +20 */ \
+                    { 0x0C,  30 }, /* +30 */ \
+                    { 0x0D,  40 }, /* +40 */ \
+                    { 0x0E,  50 }, /* +50 */ \
+                    { 0x0F,  60 }  /* +60 */ \
+                } }
+
+// Thanks to Olivier Schmitt sc.olivier@gmail.com for these tables
+#define FT857_PWR_CAL { 9, \
+                { \
+                    { 0x00, 0.0f }, \
+                    { 0x01, 0.5f }, \
+                    { 0x02, 0.75f }, \
+                    { 0x03, 1.0f }, \
+                    { 0x04, 1.7f }, \
+                    { 0x05, 2.5f }, \
+                    { 0x06, 3.3f }, \
+                    { 0x07, 4.1f }, \
+                    { 0x08, 5.0f } \
+                } }
+
+#define FT857_ALC_CAL { 6, \
+                { \
+                    { 0x00, 0 }, \
+                    { 0x01, 20 }, \
+                    { 0x02, 40 }, \
+                    { 0x03, 60 }, \
+                    { 0x04, 80 }, \
+                    { 0x05, 100 } \
+                } }
+
+// SWR values from Christian WA4YA, DL4YA
+#define FT857_SWR_CAL { 16, \
+                { \
+                    { 0, 1.0f }, \
+                    { 1, 1.4f }, \
+                    { 2, 1.8f }, \
+                    { 3, 2.13f }, \
+                    { 4, 2.25f }, \
+                    { 5, 3.7f }, \
+                    { 6, 6.0f }, \
+                    { 7, 7.0f }, \
+                    { 8, 8.0f }, \
+                    { 9, 9.0f }, \
+                    { 10, 10.0f }, \
+                    { 11, 10.0f }, \
+                    { 12, 10.0f }, \
+                    { 13, 10.0f }, \
+                    { 14, 10.0f }, \
+                    { 15, 10.0f } \
+                } }
+
+
+
 struct rig_caps ft857_caps =
 {
     RIG_MODEL(RIG_MODEL_FT857),
@@ -263,7 +342,9 @@ struct rig_caps ft857_caps =
     .retry =      0,
     .has_get_func =       RIG_FUNC_NONE,
     .has_set_func =   RIG_FUNC_LOCK | RIG_FUNC_TONE | RIG_FUNC_TSQL | RIG_FUNC_CSQL | RIG_FUNC_RIT,
-    .has_get_level =  RIG_LEVEL_STRENGTH | RIG_LEVEL_RFPOWER,
+    .has_get_level =
+    RIG_LEVEL_STRENGTH | RIG_LEVEL_RAWSTR | RIG_LEVEL_RFPOWER |
+    RIG_LEVEL_ALC | RIG_LEVEL_SWR | RIG_LEVEL_RFPOWER_METER_WATTS,
     .has_set_level =  RIG_LEVEL_BAND_SELECT,
     .has_get_parm =   RIG_PARM_NONE,
     .has_set_parm =   RIG_PARM_NONE,
@@ -391,12 +472,16 @@ struct rig_caps ft857_caps =
 
 int ft857_init(RIG *rig)
 {
+    struct ft857_priv_data *p;
     rig_debug(RIG_DEBUG_VERBOSE, "%s: called \n", __func__);
 
     if ((STATE(rig)->priv = calloc(1, sizeof(struct ft857_priv_data))) == NULL)
     {
         return -RIG_ENOMEM;
     }
+    p = (struct ft857_priv_data *) STATE(rig)->priv;
+
+    p->swr = 10;
 
     return RIG_OK;
 }
@@ -505,6 +590,7 @@ static int ft857_get_status(RIG *rig, int status)
     unsigned char *data;
     int len;
     int n;
+    unsigned char result[2];
 
     rig_debug(RIG_DEBUG_VERBOSE, "%s: called \n", __func__);
 
@@ -520,6 +606,12 @@ static int ft857_get_status(RIG *rig, int status)
         data = &p->rx_status;
         len  = 1;
         tv   = &p->rx_status_tv;
+        break;
+
+    case FT857_NATIVE_CAT_GET_TX_METERING:
+        data = result;
+        len = sizeof(result) / sizeof(result[0]); /* We expect two bytes */
+        tv = &p->tx_level_tv;
         break;
 
     case FT857_NATIVE_CAT_GET_TX_STATUS:
@@ -547,7 +639,9 @@ static int ft857_get_status(RIG *rig, int status)
         return -RIG_EIO;
     }
 
-    if (status == FT857_NATIVE_CAT_GET_FREQ_MODE_STATUS)
+    switch (status)
+    {
+    case FT857_NATIVE_CAT_GET_FREQ_MODE_STATUS:
     {
         if ((n = ft857_read_eeprom(rig, 0x0078, &p->fm_status[5])) < 0)
         {
@@ -555,6 +649,24 @@ static int ft857_get_status(RIG *rig, int status)
         }
 
         p->fm_status[5] >>= 5;
+    }
+    break;
+
+    case FT857_NATIVE_CAT_GET_TX_METERING:
+        /* FT-857 returns 2 bytes with 4 nibbles.
+         * Extract raw values here;
+         * convert to float when they are requested. */
+        p->swr_level = (result[1] & 0xF0) >> 4;
+        p->pwr_level = (result[0] & 0xF0) >> 4;
+        p->alc_level = result[0] & 0x0F;
+        p->mod_level = result[1] >> 4;
+        rig_debug(RIG_DEBUG_TRACE, "%s: swr: %d, pwr %d, alc %d, mod %d\n",
+                  __func__,
+                  p->swr_level,
+                  p->pwr_level,
+                  p->alc_level,
+                  p->mod_level);
+        break;
     }
 
     gettimeofday(tv, NULL);
@@ -811,10 +923,12 @@ int ft857_get_split_vfo(RIG *rig, vfo_t vfo, split_t *split, vfo_t *tx_vfo)
         }
 
         *split = (c & 0x80) ? RIG_SPLIT_ON : RIG_SPLIT_OFF;
+        *tx_vfo = RIG_VFO_A;
     }
     else
     {
         *split = (p->tx_status & 0x20) ? RIG_SPLIT_ON : RIG_SPLIT_OFF;
+        *tx_vfo = RIG_VFO_B;
     }
 
     return RIG_OK;
@@ -836,7 +950,7 @@ int ft857_get_ptt(RIG *rig, vfo_t vfo, ptt_t *ptt)
         }
     }
 
-    *ptt = ((p->tx_status & 0x80) == 0);
+    *ptt = p->tx_status != 0xff;
 
     return RIG_OK;
 }
@@ -892,8 +1006,60 @@ static int ft857_get_smeter_level(RIG *rig, value_t *val)
     return RIG_OK;
 }
 
+
+static int ft857_get_tx_level(RIG *rig, value_t *val, unsigned char *tx_level,
+                              const cal_table_float_t *cal)
+{
+    struct ft857_priv_data *p = (struct ft857_priv_data *) STATE(rig)->priv;
+
+    rig_debug(RIG_DEBUG_VERBOSE, "%s: called\n", __func__);
+
+    if (check_cache_timeout(&p->tx_level_tv))
+    {
+        int n;
+        ptt_t ptt;
+
+        /* Default to not keyed */
+        *tx_level = 0;
+
+        /* TX metering is special; it sends 1 byte if not keyed and 2 if keyed.
+         * To handle this properly we first verify the rig is keyed.
+         * Otherwise we experience at least a full timeout and
+         * perhaps pointless retries + timeouts.
+         */
+        n = ft857_get_ptt(rig, 0, &ptt);
+
+        if (n != RIG_OK)
+        {
+            return n;
+        }
+
+        if (ptt == RIG_PTT_OFF)
+        {
+
+	      val->f = p->swr;
+            return RIG_OK;
+        }
+
+        n = ft857_get_status(rig, FT857_NATIVE_CAT_GET_TX_METERING);
+
+        if (n != RIG_OK)
+        {
+            return n;
+        }
+    }
+
+    p->swr = val->f = rig_raw2val_float(*tx_level, cal);
+
+    rig_debug(RIG_DEBUG_VERBOSE, "%s: level %f\n", __func__, val->f);
+
+    return RIG_OK;
+}
+
 int ft857_get_level(RIG *rig, vfo_t vfo, setting_t level, value_t *val)
 {
+    struct ft857_priv_data *p = (struct ft857_priv_data *) STATE(rig)->priv;
+
     rig_debug(RIG_DEBUG_VERBOSE, "%s: called \n", __func__);
 
     switch (level)
@@ -903,6 +1069,16 @@ int ft857_get_level(RIG *rig, vfo_t vfo, setting_t level, value_t *val)
 
     case RIG_LEVEL_RFPOWER:
         return ft857_get_pometer_level(rig, val);
+
+    case RIG_LEVEL_ALC:
+        return ft857_get_tx_level(rig, val, &p->alc_level, &rig->caps->alc_cal);
+
+    case RIG_LEVEL_SWR:
+        return ft857_get_tx_level(rig, val, &p->swr_level, &rig->caps->swr_cal);
+
+    case RIG_LEVEL_RFPOWER_METER_WATTS:
+        return ft857_get_tx_level(rig, val, &p->pwr_level,
+                                  &rig->caps->rfpower_meter_cal);
 
     default:
         return -RIG_EINVAL;
@@ -1397,4 +1573,3 @@ int ft857_vfo_op(RIG *rig, vfo_t vfo, vfo_op_t op)
 }
 
 /* ---------------------------------------------------------------------- */
-
